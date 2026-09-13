@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.DoubleAdder;
 
 /**
  * Thread-safe tracker for LLM token usage and estimated costs.
+ * Strictly distinguishes real AI model API calls from local deterministic operations.
  * Generates the summary required for evaluation/usage_report.md.
  */
 @Component
@@ -18,6 +19,8 @@ public class TokenUsageTracker {
     private final AtomicInteger totalPromptTokens = new AtomicInteger(0);
     private final AtomicInteger totalCompletionTokens = new AtomicInteger(0);
     private final DoubleAdder totalEstimatedCost = new DoubleAdder();
+
+    private final AtomicInteger deterministicCalls = new AtomicInteger(0);
 
     private final Map<String, AtomicInteger> callsByModel = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> promptTokensByModel = new ConcurrentHashMap<>();
@@ -32,6 +35,11 @@ public class TokenUsageTracker {
         callsByModel.computeIfAbsent(modelName, k -> new AtomicInteger(0)).incrementAndGet();
         promptTokensByModel.computeIfAbsent(modelName, k -> new AtomicInteger(0)).addAndGet(promptTokens);
         completionTokensByModel.computeIfAbsent(modelName, k -> new AtomicInteger(0)).addAndGet(completionTokens);
+    }
+
+    public void recordDeterministicOperation() {
+        totalCalls.incrementAndGet();
+        deterministicCalls.incrementAndGet();
     }
 
     public int getTotalCalls() {
@@ -54,6 +62,10 @@ public class TokenUsageTracker {
         return totalEstimatedCost.sum();
     }
 
+    public int getDeterministicCalls() {
+        return deterministicCalls.get();
+    }
+
     public String generateUsageReport(int totalRequestsEvaluated) {
         int requests = Math.max(1, totalRequestsEvaluated);
         int totalToks = getTotalTokens();
@@ -64,12 +76,12 @@ public class TokenUsageTracker {
 
         StringBuilder sb = new StringBuilder();
         sb.append("# AI Model Token Usage & Cost Report\n\n");
-        sb.append("This report summarizes the LLM usage for evidence extraction and multimodal analysis.\n\n");
+        sb.append("This report summarizes the model and deterministic execution metrics for evidence extraction and analysis.\n\n");
         sb.append("## Overall Summary\n\n");
         sb.append("| Metric | Value |\n");
         sb.append("|---|---|\n");
         sb.append(String.format("| **Total Requests Evaluated** | %d |\n", totalRequestsEvaluated));
-        sb.append(String.format("| **Total Model Invocations** | %d |\n", calls));
+        sb.append(String.format("| **Total Engine Invocations** | %d |\n", calls));
         sb.append(String.format("| **Total Input (Prompt) Tokens** | %d |\n", getTotalPromptTokens()));
         sb.append(String.format("| **Total Output (Completion) Tokens** | %d |\n", getTotalCompletionTokens()));
         sb.append(String.format("| **Total Tokens** | %d |\n", totalToks));
@@ -78,17 +90,21 @@ public class TokenUsageTracker {
         sb.append(String.format("| **Estimated Cost per Request (USD)** | $%.6f |\n\n", avgCostPerRequest));
 
         sb.append("## Usage by Model Provider\n\n");
-        sb.append("| Model Name | Calls | Input Tokens | Output Tokens | Total Tokens |\n");
-        sb.append("|---|---|---|---|---|\n");
+        sb.append("| Provider | Model Name | Invocations | Input Tokens | Output Tokens | Total Tokens | Estimated Cost |\n");
+        sb.append("|---|---|---|---|---|---|---|\n");
 
         if (callsByModel.isEmpty()) {
-            sb.append("| Deterministic Engine (Offline Fallback) | ").append(calls).append(" | 0 | 0 | 0 |\n");
+            sb.append(String.format("| `local` | `deterministic-rule-engine` | %d | 0 | 0 | 0 | $0.0000 |\n", calls));
         } else {
             for (String model : callsByModel.keySet()) {
                 int c = callsByModel.get(model).get();
                 int pt = promptTokensByModel.getOrDefault(model, new AtomicInteger(0)).get();
                 int ct = completionTokensByModel.getOrDefault(model, new AtomicInteger(0)).get();
-                sb.append(String.format("| `%s` | %d | %d | %d | %d |\n", model, c, pt, ct, pt + ct));
+                double cost = (pt * 0.075 + ct * 0.30) / 1_000_000.0;
+                sb.append(String.format("| `Google` | `%s` | %d | %d | %d | %d | $%.4f |\n", model, c, pt, ct, pt + ct, cost));
+            }
+            if (deterministicCalls.get() > 0) {
+                sb.append(String.format("| `local` | `deterministic-rule-engine` | %d | 0 | 0 | 0 | $0.0000 |\n", deterministicCalls.get()));
             }
         }
 

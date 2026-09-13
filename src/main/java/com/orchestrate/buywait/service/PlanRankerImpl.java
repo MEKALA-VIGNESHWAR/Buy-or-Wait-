@@ -95,12 +95,6 @@ public class PlanRankerImpl implements PlanRanker {
             if (p1NoChanges != p2NoChanges) {
                 return p1NoChanges ? -1 : 1;
             }
-            if (!p1NoChanges && !p2NoChanges) {
-                int changeCountCmp = Integer.compare(p1.spendingChanges().size(), p2.spendingChanges().size());
-                if (changeCountCmp != 0) {
-                    return changeCountCmp;
-                }
-            }
 
             // =========================================================================
             // Criterion 3: Minimize total amount paid.

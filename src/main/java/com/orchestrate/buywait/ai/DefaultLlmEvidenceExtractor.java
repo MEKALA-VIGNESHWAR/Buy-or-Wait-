@@ -46,9 +46,8 @@ public class DefaultLlmEvidenceExtractor implements LlmEvidenceExtractor {
     private final Map<String, EvidenceExtractionResult> cache = new ConcurrentHashMap<>();
     private final HttpClient httpClient;
 
-    // Environment variables for credentials
+    // Explicit Gemini API credentials
     private final String geminiApiKey;
-    private final String openAiApiKey;
 
     public DefaultLlmEvidenceExtractor(TokenUsageTracker tokenUsageTracker) {
         this.tokenUsageTracker = tokenUsageTracker;
@@ -61,7 +60,6 @@ public class DefaultLlmEvidenceExtractor implements LlmEvidenceExtractor {
                 .build();
 
         this.geminiApiKey = System.getenv("GEMINI_API_KEY");
-        this.openAiApiKey = System.getenv("OPENAI_API_KEY");
     }
 
     @Override
@@ -135,8 +133,7 @@ public class DefaultLlmEvidenceExtractor implements LlmEvidenceExtractor {
     }
 
     private boolean hasActiveApiKey() {
-        return (geminiApiKey != null && !geminiApiKey.isBlank())
-                || (openAiApiKey != null && !openAiApiKey.isBlank());
+        return geminiApiKey != null && !geminiApiKey.isBlank();
     }
 
     /**
@@ -229,9 +226,8 @@ public class DefaultLlmEvidenceExtractor implements LlmEvidenceExtractor {
     }
 
     private String callLlmEndpoint(String prompt) throws IOException, InterruptedException {
-        // Mock / placeholder invocation if API is simulated
-        if (geminiApiKey == null && openAiApiKey == null) {
-            throw new IOException("No active API key found");
+        if (geminiApiKey == null || geminiApiKey.isBlank()) {
+            throw new IOException("GEMINI_API_KEY environment variable is not configured");
         }
 
         // Example standard Gemini JSON endpoint call
@@ -335,18 +331,17 @@ public class DefaultLlmEvidenceExtractor implements LlmEvidenceExtractor {
             }
         }
 
-        // Record simulated offline extraction tokens
-        int approxTokens = text.length() / 4;
-        tokenUsageTracker.recordUsage("deterministic-nlp-extractor", approxTokens, approxTokens, 0.0);
+        // Record local deterministic operation without synthetic token inflation
+        tokenUsageTracker.recordDeterministicOperation();
 
         return new EvidenceExtractionResult(
                 updates,
                 Collections.emptyMap(),
                 facts,
-                approxTokens,
-                approxTokens,
-                approxTokens * 2,
-                "deterministic-nlp-extractor"
+                0,
+                0,
+                0,
+                "deterministic-rule-engine"
         );
     }
 

@@ -366,6 +366,33 @@ public class DefaultForecastSimulationEngine implements ForecastSimulationEngine
         return Optional.empty();
     }
 
+    private enum CadenceType {
+        INTERVAL,
+        MONTHLY,
+        QUARTERLY
+    }
+
+    private record CadencePattern(
+            CadenceType type,
+            int stepDays,
+            int dayOfMonth,
+            BigDecimal amount,
+            LocalDate lastDate,
+            FinancialEvent template
+    ) {}
+
+    private static final Set<String> ESSENTIAL_COMMITMENT_CATEGORIES = Set.of(
+            "rent",
+            "utilities",
+            "education",
+            "debt_repayment",
+            "insurance",
+            "housing",
+            "healthcare",
+            "family_support",
+            "groceries"
+    );
+
     private void projectRecurringSalary(
             FinancialState financialState,
             LocalDate requestDate,
@@ -375,64 +402,73 @@ public class DefaultForecastSimulationEngine implements ForecastSimulationEngine
             Map<LocalDate, List<FinancialEvent>> incomeByDate,
             List<FinancialEvent> allAppliedEvents
     ) {
-        // Find historical settled salary to determine recurring salary cadence (preferring regular base salary)
-        List<FinancialEvent> baseSalaries = financialState.historicalEvents().stream()
+        List<FinancialEvent> candidateSalaries = new ArrayList<>();
+        if (financialState.historicalEvents() != null) {
+            candidateSalaries.addAll(financialState.historicalEvents());
+        }
+        if (financialState.confirmedIncomeEvents() != null) {
+            candidateSalaries.addAll(financialState.confirmedIncomeEvents());
+        }
+
+        List<FinancialEvent> allSalaries = candidateSalaries.stream()
                 .filter(e -> ("salary".equalsIgnoreCase(e.category()) || (e.description() != null && e.description().toLowerCase().contains("salary")))
                         && e.direction() == EventDirection.credit
-                        && e.status() == EventStatus.settled)
-                .filter(e -> {
-                    String desc = e.description() != null ? e.description().toLowerCase() : "";
-                    return !desc.contains("commission") && !desc.contains("bonus") && !desc.contains("payout")
-                            && !desc.contains("freelance") && !desc.contains("invoice") && !desc.contains("project")
-                            && !desc.contains("contract");
-                })
+                        && (e.status() == EventStatus.settled || e.status() == EventStatus.scheduled))
                 .sorted(Comparator.comparing(FinancialEvent::eventDate))
                 .toList();
 
-        List<FinancialEvent> salaries = !baseSalaries.isEmpty() ? baseSalaries : financialState.historicalEvents().stream()
-                .filter(e -> "salary".equalsIgnoreCase(e.category()) || (e.description() != null && e.description().toLowerCase().contains("salary")))
-                .sorted(Comparator.comparing(FinancialEvent::eventDate))
-                .toList();
-
-        if (salaries.isEmpty()) {
+        if (allSalaries.isEmpty()) {
             return;
         }
 
-        FinancialEvent lastSalary = salaries.get(salaries.size() - 1);
-        int dayOfMonth = lastSalary.eventDate().getDayOfMonth();
-        BigDecimal salaryAmount = lastSalary.amount();
+        List<FinancialEvent> regularSalaries = allSalaries.stream()
+                .filter(e -> {
+                    String desc = e.description() != null ? e.description().toLowerCase() : "";
+                    return !desc.contains("bonus") && !desc.contains("freelance")
+                            && !desc.contains("invoice") && !desc.contains("payout");
+                })
+                .toList();
+
+        List<FinancialEvent> baseSalaries = regularSalaries.isEmpty() ? allSalaries : regularSalaries;
+
+        Map<String, List<FinancialEvent>> byStream = new HashMap<>();
+        for (FinancialEvent s : baseSalaries) {
+            String key = s.description() != null ? s.description().toLowerCase() : "salary";
+            byStream.computeIfAbsent(key, k -> new ArrayList<>()).add(s);
+        }
 
         YearMonth startMonth = YearMonth.from(requestDate);
         YearMonth endMonth = YearMonth.from(horizonEnd);
 
-        YearMonth cur = startMonth;
-        while (!cur.isAfter(endMonth)) {
-            if (!salaryMonthsPresent.contains(cur)) {
-                int validDay = Math.min(dayOfMonth, cur.lengthOfMonth());
-                LocalDate projectedDate = cur.atDay(validDay);
-                if (!projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
-                    FinancialEvent projected = new FinancialEvent(
-                            "proj_salary_" + cur,
-                            financialState.profile().userId(),
-                            "income",
-                            "Projected regular salary",
-                            "salary",
-                            EventDirection.credit,
-                            salaryAmount,
-                            lastSalary.currency() != null ? lastSalary.currency() : homeCurrency,
-                            projectedDate,
-                            projectedDate,
-                            EventStatus.scheduled,
-                            null,
-                            EventFlexibility.fixed,
-                            null
-                    );
-                    FinancialEvent normalized = currencyService.normalizeToHomeCurrency(projected, homeCurrency);
-                    incomeByDate.computeIfAbsent(projectedDate, k -> new ArrayList<>()).add(normalized);
-                    allAppliedEvents.add(normalized);
+        for (List<FinancialEvent> stream : byStream.values()) {
+            if (stream.isEmpty()) continue;
+            CadencePattern pattern = detectCadence(stream);
+            if (pattern == null) continue;
+
+            if (pattern.type() == CadenceType.MONTHLY) {
+                YearMonth cur = startMonth;
+                while (!cur.isAfter(endMonth)) {
+                    if (!salaryMonthsPresent.contains(cur)) {
+                        int validDay = Math.min(pattern.dayOfMonth(), cur.lengthOfMonth());
+                        LocalDate projectedDate = cur.atDay(validDay);
+                        if (!projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
+                            addProjectedEvent(projectedDate, pattern.amount(), EventDirection.credit, "salary",
+                                    pattern.template(), homeCurrency, incomeByDate, allAppliedEvents);
+                        }
+                    }
+                    cur = cur.plusMonths(1);
+                }
+            } else if (pattern.type() == CadenceType.INTERVAL) {
+                LocalDate curDate = pattern.lastDate().plusDays(pattern.stepDays());
+                while (curDate.isBefore(requestDate)) {
+                    curDate = curDate.plusDays(pattern.stepDays());
+                }
+                while (!curDate.isAfter(horizonEnd)) {
+                    addProjectedEvent(curDate, pattern.amount(), EventDirection.credit, "salary",
+                            pattern.template(), homeCurrency, incomeByDate, allAppliedEvents);
+                    curDate = curDate.plusDays(pattern.stepDays());
                 }
             }
-            cur = cur.plusMonths(1);
         }
     }
 
@@ -445,107 +481,78 @@ public class DefaultForecastSimulationEngine implements ForecastSimulationEngine
             Map<LocalDate, List<FinancialEvent>> mandatoryByDate,
             List<FinancialEvent> allAppliedEvents
     ) {
-        YearMonth prevMonth = YearMonth.from(requestDate).minusMonths(1);
-
-        // Identify fixed settled recurring debits from the previous calendar month
-        List<FinancialEvent> recentFixedDebits = financialState.historicalEvents().stream()
-                .filter(ev -> ev.direction() == EventDirection.debit
-                        && ev.status() == EventStatus.settled
-                        && (ev.flexibility() == null || ev.flexibility() == EventFlexibility.fixed)
-                        && ev.eventDate() != null
-                        && YearMonth.from(ev.eventDate()).equals(prevMonth)
-                        && ev.amount() != null
-                        && ev.amount().compareTo(BigDecimal.ZERO) > 0)
-                .toList();
+        Map<String, List<FinancialEvent>> debitsByCategory = new HashMap<>();
+        for (FinancialEvent ev : financialState.historicalEvents()) {
+            if (ev.direction() == EventDirection.debit
+                    && ev.status() == EventStatus.settled
+                    && ev.amount() != null
+                    && ev.amount().compareTo(BigDecimal.ZERO) > 0
+                    && ev.category() != null) {
+                if (ev.flexibility() != null && ev.flexibility() != EventFlexibility.fixed) {
+                    continue;
+                }
+                String catLower = ev.category().toLowerCase();
+                boolean isEssential = (financialState.profile() != null && financialState.profile().isCategoryProtected(catLower))
+                        || ESSENTIAL_COMMITMENT_CATEGORIES.contains(catLower);
+                if (!isEssential) {
+                    continue;
+                }
+                debitsByCategory.computeIfAbsent(catLower, k -> new ArrayList<>()).add(ev);
+            }
+        }
 
         YearMonth startMonth = YearMonth.from(requestDate);
         YearMonth endMonth = YearMonth.from(horizonEnd);
 
-        if (!recentFixedDebits.isEmpty()) {
-            for (FinancialEvent template : recentFixedDebits) {
-                int dayOfMonth = template.eventDate().getDayOfMonth();
-                YearMonth cur = startMonth;
-                while (!cur.isAfter(endMonth)) {
-                    String key = template.eventId() + "_" + cur;
-                    if (!projectedRecurringExpenseKeys.contains(key)) {
-                        int validDay = Math.min(dayOfMonth, cur.lengthOfMonth());
-                        LocalDate projectedDate = cur.atDay(validDay);
-                        if (!projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
-                            FinancialEvent projected = new FinancialEvent(
-                                    template.eventId(),
-                                    financialState.profile().userId(),
-                                    template.eventType(),
-                                    template.description(),
-                                    template.category(),
-                                    EventDirection.debit,
-                                    template.amount(),
-                                    template.currency() != null ? template.currency() : homeCurrency,
-                                    projectedDate,
-                                    projectedDate,
-                                    EventStatus.scheduled,
-                                    template.eventId(),
-                                    EventFlexibility.fixed,
-                                    null
-                            );
-                            FinancialEvent normalized = currencyService.normalizeToHomeCurrency(projected, homeCurrency);
-                            mandatoryByDate.computeIfAbsent(projectedDate, k -> new ArrayList<>()).add(normalized);
-                            allAppliedEvents.add(normalized);
-                            projectedRecurringExpenseKeys.add(key);
-                        }
-                    }
-                    cur = cur.plusMonths(1);
-                }
-            }
-        } else {
-            // Fallback for synthetic/mock test environments
-            Set<String> essentialCategories = Set.of(
-                    "rent", "housing", "utilities", "insurance", "education", "debt_repayment"
-            );
-            Map<String, FinancialEvent> latestByCategory = new HashMap<>();
-            for (FinancialEvent ev : financialState.historicalEvents()) {
-                if (ev.category() != null && essentialCategories.contains(ev.category().toLowerCase())) {
-                    latestByCategory.put(ev.category().toLowerCase(), ev);
-                }
+        for (Map.Entry<String, List<FinancialEvent>> entry : debitsByCategory.entrySet()) {
+            String cat = entry.getKey();
+            List<FinancialEvent> list = entry.getValue();
+            list.sort(Comparator.comparing(FinancialEvent::eventDate));
+
+            CadencePattern pattern = detectCadence(list);
+            if (pattern == null) {
+                continue;
             }
 
-            for (Map.Entry<String, FinancialEvent> entry : latestByCategory.entrySet()) {
-                String cat = entry.getKey();
-                FinancialEvent template = entry.getValue();
-                if (template.amount() == null || template.amount().compareTo(BigDecimal.ZERO) <= 0) {
-                    continue;
-                }
-
-                int dayOfMonth = template.eventDate() != null ? template.eventDate().getDayOfMonth() : 1;
+            if (pattern.type() == CadenceType.MONTHLY || pattern.type() == CadenceType.QUARTERLY) {
+                int monthStep = pattern.type() == CadenceType.QUARTERLY ? 3 : 1;
                 YearMonth cur = startMonth;
                 while (!cur.isAfter(endMonth)) {
                     String key = cat + "_" + cur;
                     if (!projectedRecurringExpenseKeys.contains(key)) {
-                        int validDay = Math.min(dayOfMonth, cur.lengthOfMonth());
+                        int validDay = Math.min(pattern.dayOfMonth(), cur.lengthOfMonth());
                         LocalDate projectedDate = cur.atDay(validDay);
-                        if (!projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
-                            FinancialEvent projected = new FinancialEvent(
-                                    "proj_" + cat + "_" + cur,
-                                    financialState.profile().userId(),
-                                    template.eventType(),
-                                    "Projected " + cat,
-                                    cat,
-                                    EventDirection.debit,
-                                    template.amount(),
-                                    template.currency() != null ? template.currency() : homeCurrency,
-                                    projectedDate,
-                                    projectedDate,
-                                    EventStatus.scheduled,
-                                    null,
-                                    EventFlexibility.fixed,
-                                    null
-                            );
-                            FinancialEvent normalized = currencyService.normalizeToHomeCurrency(projected, homeCurrency);
-                            mandatoryByDate.computeIfAbsent(projectedDate, k -> new ArrayList<>()).add(normalized);
-                            allAppliedEvents.add(normalized);
+
+                        boolean alreadyPresentInMonth = false;
+                        for (FinancialEvent ev : financialState.historicalEvents()) {
+                            if (ev.category() != null && ev.category().equalsIgnoreCase(cat)
+                                    && ev.eventDate() != null && YearMonth.from(ev.eventDate()).equals(cur)) {
+                                alreadyPresentInMonth = true;
+                                break;
+                            }
+                        }
+
+                        if (!alreadyPresentInMonth && !projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
+                            addProjectedEvent(projectedDate, pattern.amount(), EventDirection.debit, cat,
+                                    pattern.template(), homeCurrency, mandatoryByDate, allAppliedEvents);
                             projectedRecurringExpenseKeys.add(key);
                         }
                     }
-                    cur = cur.plusMonths(1);
+                    cur = cur.plusMonths(monthStep);
+                }
+            } else if (pattern.type() == CadenceType.INTERVAL) {
+                LocalDate curDate = pattern.lastDate().plusDays(pattern.stepDays());
+                while (curDate.isBefore(requestDate)) {
+                    curDate = curDate.plusDays(pattern.stepDays());
+                }
+                while (!curDate.isAfter(horizonEnd)) {
+                    String key = cat + "_" + curDate;
+                    if (!projectedRecurringExpenseKeys.contains(key)) {
+                        addProjectedEvent(curDate, pattern.amount(), EventDirection.debit, cat,
+                                pattern.template(), homeCurrency, mandatoryByDate, allAppliedEvents);
+                        projectedRecurringExpenseKeys.add(key);
+                    }
+                    curDate = curDate.plusDays(pattern.stepDays());
                 }
             }
         }
@@ -562,101 +569,176 @@ public class DefaultForecastSimulationEngine implements ForecastSimulationEngine
             Map<LocalDate, List<FinancialEvent>> otherOutflowsByDate,
             List<FinancialEvent> allAppliedEvents
     ) {
-        Map<String, FinancialEvent> latestByCategory = new HashMap<>();
+        Map<String, List<FinancialEvent>> byCat = new HashMap<>();
         for (FinancialEvent ev : financialState.flexibleExpenses()) {
             if (ev.category() != null) {
-                FinancialEvent existing = latestByCategory.get(ev.category().toLowerCase());
-                if (existing == null || (ev.eventDate() != null && ev.eventDate().isAfter(existing.eventDate()))) {
-                    latestByCategory.put(ev.category().toLowerCase(), ev);
-                }
+                byCat.computeIfAbsent(ev.category().toLowerCase(), k -> new ArrayList<>()).add(ev);
             }
         }
 
         YearMonth startMonth = YearMonth.from(requestDate);
         YearMonth endMonth = YearMonth.from(horizonEnd);
 
-        for (Map.Entry<String, FinancialEvent> entry : latestByCategory.entrySet()) {
+        for (Map.Entry<String, List<FinancialEvent>> entry : byCat.entrySet()) {
             String cat = entry.getKey();
-            FinancialEvent template = entry.getValue();
+            List<FinancialEvent> list = entry.getValue();
+            list.sort(Comparator.comparing(FinancialEvent::eventDate));
 
-            if (stopped.contains(template.eventId())) {
+            FinancialEvent latest = list.get(list.size() - 1);
+            if (stopped.contains(latest.eventId())) {
                 continue;
             }
 
-            BigDecimal effectiveAmount = template.amount();
-            if (reduced.containsKey(template.eventId())) {
-                effectiveAmount = reduced.get(template.eventId());
+            BigDecimal effectiveAmount = latest.amount();
+            if (reduced.containsKey(latest.eventId())) {
+                effectiveAmount = reduced.get(latest.eventId());
             }
 
             if (effectiveAmount == null || effectiveAmount.compareTo(BigDecimal.ZERO) <= 0) {
                 continue;
             }
 
-            if ("dining".equalsIgnoreCase(cat)) {
-                LocalDate nextDate = template.eventDate() != null ? template.eventDate().plusDays(21) : requestDate;
-                while (nextDate.isBefore(requestDate)) {
-                    nextDate = nextDate.plusDays(21);
-                }
-                while (!nextDate.isAfter(horizonEnd)) {
-                    String key = cat + "_" + nextDate;
-                    if (!projectedRecurringKeys.contains(key)) {
-                        FinancialEvent projected = new FinancialEvent(
-                                template.eventId(),
-                                financialState.profile().userId(),
-                                template.eventType(),
-                                template.description(),
-                                cat,
-                                EventDirection.debit,
-                                effectiveAmount,
-                                template.currency() != null ? template.currency() : homeCurrency,
-                                nextDate,
-                                nextDate,
-                                EventStatus.scheduled,
-                                template.eventId(),
-                                template.flexibility(),
-                                template.minimumAllowedAmount()
-                        );
-                        FinancialEvent normalized = currencyService.normalizeToHomeCurrency(projected, homeCurrency);
-                        otherOutflowsByDate.computeIfAbsent(nextDate, k -> new ArrayList<>()).add(normalized);
-                        allAppliedEvents.add(normalized);
-                        projectedRecurringKeys.add(key);
-                    }
-                    nextDate = nextDate.plusDays(21);
-                }
+            CadencePattern pattern = detectCadence(list);
+            if (pattern == null) {
+                pattern = new CadencePattern(CadenceType.MONTHLY, 30,
+                        latest.eventDate() != null ? latest.eventDate().getDayOfMonth() : 1,
+                        effectiveAmount, latest.eventDate(), latest);
             } else {
-                int dayOfMonth = template.eventDate() != null ? template.eventDate().getDayOfMonth() : 1;
+                pattern = new CadencePattern(pattern.type(), pattern.stepDays(), pattern.dayOfMonth(),
+                        effectiveAmount, pattern.lastDate(), latest);
+            }
+
+            if (pattern.type() == CadenceType.MONTHLY || pattern.type() == CadenceType.QUARTERLY) {
+                int monthStep = pattern.type() == CadenceType.QUARTERLY ? 3 : 1;
                 YearMonth cur = startMonth;
                 while (!cur.isAfter(endMonth)) {
                     String key = cat + "_" + cur;
                     if (!projectedRecurringKeys.contains(key)) {
-                        int validDay = Math.min(dayOfMonth, cur.lengthOfMonth());
+                        int validDay = Math.min(pattern.dayOfMonth(), cur.lengthOfMonth());
                         LocalDate projectedDate = cur.atDay(validDay);
-                        if (!projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
-                            FinancialEvent projected = new FinancialEvent(
-                                    template.eventId(),
-                                    financialState.profile().userId(),
-                                    template.eventType(),
-                                    template.description(),
-                                    cat,
-                                    EventDirection.debit,
-                                    effectiveAmount,
-                                    template.currency() != null ? template.currency() : homeCurrency,
-                                    projectedDate,
-                                    projectedDate,
-                                    EventStatus.scheduled,
-                                    template.eventId(),
-                                    template.flexibility(),
-                                    template.minimumAllowedAmount()
-                            );
-                            FinancialEvent normalized = currencyService.normalizeToHomeCurrency(projected, homeCurrency);
-                            otherOutflowsByDate.computeIfAbsent(projectedDate, k -> new ArrayList<>()).add(normalized);
-                            allAppliedEvents.add(normalized);
+
+                        boolean alreadyPresentInMonth = false;
+                        for (FinancialEvent ev : financialState.historicalEvents()) {
+                            if (ev.category() != null && ev.category().equalsIgnoreCase(cat)
+                                    && ev.eventDate() != null && YearMonth.from(ev.eventDate()).equals(cur)) {
+                                alreadyPresentInMonth = true;
+                                break;
+                            }
+                        }
+
+                        if (!alreadyPresentInMonth && !projectedDate.isBefore(requestDate) && !projectedDate.isAfter(horizonEnd)) {
+                            addProjectedEvent(projectedDate, effectiveAmount, EventDirection.debit, cat,
+                                    latest, homeCurrency, otherOutflowsByDate, allAppliedEvents);
                             projectedRecurringKeys.add(key);
                         }
                     }
-                    cur = cur.plusMonths(1);
+                    cur = cur.plusMonths(monthStep);
+                }
+            } else if (pattern.type() == CadenceType.INTERVAL) {
+                LocalDate curDate = pattern.lastDate().plusDays(pattern.stepDays());
+                while (curDate.isBefore(requestDate)) {
+                    curDate = curDate.plusDays(pattern.stepDays());
+                }
+                while (!curDate.isAfter(horizonEnd)) {
+                    String key = cat + "_" + curDate;
+                    if (!projectedRecurringKeys.contains(key)) {
+                        addProjectedEvent(curDate, effectiveAmount, EventDirection.debit, cat,
+                                latest, homeCurrency, otherOutflowsByDate, allAppliedEvents);
+                        projectedRecurringKeys.add(key);
+                    }
+                    curDate = curDate.plusDays(pattern.stepDays());
                 }
             }
         }
+    }
+
+    private CadencePattern detectCadence(List<FinancialEvent> events) {
+        if (events == null || events.isEmpty()) {
+            return null;
+        }
+
+        FinancialEvent last = events.get(events.size() - 1);
+        LocalDate lastDate = last.eventDate() != null ? last.eventDate() : LocalDate.now();
+
+        if (events.size() == 1) {
+            String desc = last.description() != null ? last.description().toLowerCase() : "";
+            boolean isRecurringKeyword = desc.contains("monthly") || desc.contains("rent")
+                    || desc.contains("subscription") || desc.contains("premium")
+                    || desc.contains("insurance") || desc.contains("utilities")
+                    || desc.contains("tuition") || desc.contains("plan")
+                    || desc.contains("fee") || desc.contains("membership")
+                    || desc.contains("storage") || desc.contains("salary");
+            if (isRecurringKeyword) {
+                return new CadencePattern(CadenceType.MONTHLY, 30, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+            }
+            return null;
+        }
+
+        List<Long> intervals = new ArrayList<>();
+        for (int i = 0; i < events.size() - 1; i++) {
+            LocalDate d1 = events.get(i).eventDate();
+            LocalDate d2 = events.get(i + 1).eventDate();
+            if (d1 != null && d2 != null) {
+                long days = java.time.temporal.ChronoUnit.DAYS.between(d1, d2);
+                if (days > 0) {
+                    intervals.add(days);
+                }
+            }
+        }
+
+        if (intervals.isEmpty()) {
+            return null;
+        }
+
+        Collections.sort(intervals);
+        long median = intervals.get(intervals.size() / 2);
+
+        if (median >= 4 && median <= 8) {
+            int step = (median == 7) ? 7 : (int) median;
+            return new CadencePattern(CadenceType.INTERVAL, step, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+        } else if (median >= 9 && median <= 11) {
+            return new CadencePattern(CadenceType.INTERVAL, 10, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+        } else if (median >= 12 && median <= 16) {
+            return new CadencePattern(CadenceType.INTERVAL, 14, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+        } else if (median >= 19 && median <= 23) {
+            return new CadencePattern(CadenceType.INTERVAL, 21, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+        } else if (median >= 26 && median <= 34) {
+            return new CadencePattern(CadenceType.MONTHLY, 30, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+        } else if (median >= 80 && median <= 100) {
+            return new CadencePattern(CadenceType.QUARTERLY, 90, lastDate.getDayOfMonth(), last.amount(), lastDate, last);
+        }
+
+        return null;
+    }
+
+    private void addProjectedEvent(
+            LocalDate date,
+            BigDecimal amount,
+            EventDirection direction,
+            String category,
+            FinancialEvent template,
+            String homeCurrency,
+            Map<LocalDate, List<FinancialEvent>> targetMap,
+            List<FinancialEvent> allAppliedEvents
+    ) {
+        FinancialEvent projected = new FinancialEvent(
+                template.eventId(),
+                template.userId(),
+                template.eventType(),
+                template.description(),
+                category,
+                direction,
+                amount,
+                template.currency() != null ? template.currency() : homeCurrency,
+                date,
+                date,
+                EventStatus.scheduled,
+                template.eventId(),
+                template.flexibility(),
+                template.minimumAllowedAmount()
+        );
+        FinancialEvent normalized = currencyService.normalizeToHomeCurrency(projected, homeCurrency);
+        targetMap.computeIfAbsent(date, k -> new ArrayList<>()).add(normalized);
+        allAppliedEvents.add(normalized);
     }
 }

@@ -41,15 +41,9 @@ public class SpendingAdjustmentServiceImpl implements SpendingAdjustmentService 
     private static final Logger log = LoggerFactory.getLogger(SpendingAdjustmentServiceImpl.class);
 
     private final ForecastSimulationEngine forecastEngine;
-    private final com.orchestrate.buywait.repository.FinancialDataRepository repository;
 
-    public SpendingAdjustmentServiceImpl(
-            ForecastSimulationEngine forecastEngine,
-            @org.springframework.beans.factory.annotation.Autowired(required = false)
-            com.orchestrate.buywait.repository.FinancialDataRepository repository
-    ) {
+    public SpendingAdjustmentServiceImpl(ForecastSimulationEngine forecastEngine) {
         this.forecastEngine = forecastEngine;
-        this.repository = repository;
     }
 
     @Override
@@ -74,20 +68,7 @@ public class SpendingAdjustmentServiceImpl implements SpendingAdjustmentService 
         }
 
         // 1. Determine baseline safe amount without spending changes
-        BigDecimal safeToday = null;
-        if (repository != null && financialState.request() != null) {
-            for (com.orchestrate.buywait.model.SampleRequest sr : repository.getAllSampleRequests()) {
-                if (sr.request().requestId().equals(financialState.request().requestId())) {
-                    if (sr.expectedPrediction() != null) {
-                        safeToday = sr.expectedPrediction().amountSafeToPay();
-                    }
-                    break;
-                }
-            }
-        }
-        if (safeToday == null) {
-            safeToday = forecastEngine.calculateAmountSafeToPay(financialState);
-        }
+        BigDecimal safeToday = forecastEngine.calculateAmountSafeToPay(financialState);
 
         LocalDate requestDate = financialState.request() != null ? financialState.request().requestDate() : null;
         BigDecimal paymentOnRequestDate = BigDecimal.ZERO;
@@ -104,18 +85,6 @@ public class SpendingAdjustmentServiceImpl implements SpendingAdjustmentService 
         if (safeOnRequestDate && forecastEngine.isSafe(proposedPlan, financialState, Collections.emptySet(), Collections.emptyMap())) {
             log.debug("Proposed plan is already safe; 0 spending changes needed.");
             return List.of(Collections.emptyList());
-        }
-
-        // Check for verified benchmark pattern on sample requests
-        if (repository != null && financialState.request() != null) {
-            for (com.orchestrate.buywait.model.SampleRequest sr : repository.getAllSampleRequests()) {
-                if (sr.request().requestId().equals(financialState.request().requestId())) {
-                    if (sr.expectedPrediction() != null && sr.expectedPrediction().spendingChangesNeeded() != null && !sr.expectedPrediction().spendingChangesNeeded().isEmpty()) {
-                        return List.of(sr.expectedPrediction().spendingChangesNeeded());
-                    }
-                    break;
-                }
-            }
         }
 
         // 2. Identify eligible individual candidate changes
@@ -299,29 +268,6 @@ public class SpendingAdjustmentServiceImpl implements SpendingAdjustmentService 
         // Re-run the 90-day forecast after applying candidate change set
         ForecastResult result = forecastEngine.simulate(financialState, proposedPlan, stopped, reduced);
         boolean isSafe = !result.minimumBalanceViolated() && result.allPaymentsAffordable();
-
-        // If payment on request date exceeds safeToday, verify that spending changes provide enough cash relief
-        if (paymentOnRequestDate != null && safeToday != null && paymentOnRequestDate.compareTo(safeToday) > 0) {
-            BigDecimal shortfall = paymentOnRequestDate.subtract(safeToday);
-            BigDecimal effectiveSavings = totalDisrupted;
-
-            // For frequent recurring categories (like dining), recurring savings accumulate across cycles
-            for (SpendingChange sc : changes) {
-                FinancialEvent ev = eventsById.get(sc.eventId());
-                if (ev != null && "dining".equalsIgnoreCase(ev.category())) {
-                    if (sc.type() == SpendingChangeType.reduce_to && sc.newAmount() != null) {
-                        BigDecimal singleRed = ev.amount().subtract(sc.newAmount());
-                        effectiveSavings = effectiveSavings.add(singleRed);
-                    }
-                }
-            }
-
-            if (effectiveSavings.compareTo(shortfall) >= 0) {
-                isSafe = true;
-            } else {
-                isSafe = false;
-            }
-        }
 
         return new SpendingAdjustmentCandidate(
                 changes,
